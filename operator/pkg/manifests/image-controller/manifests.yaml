@@ -57,6 +57,11 @@ spec:
               credentials:
                 description: Credentials management.
                 properties:
+                  regenerate-namespace-pull-token:
+                    description: |-
+                      RegenerateNamespacePullToken defines a request to refresh namespace pull robot credentials.
+                      The field gets cleared after the refresh.
+                    type: boolean
                   regenerate-token:
                     description: |-
                       RegenerateToken defines a request to refresh image accessing credentials.
@@ -76,7 +81,7 @@ spec:
                   name:
                     description: |-
                       Name of the image within configured Quay organization.
-                      If ommited, then defaults to "cr-namespace/cr-name".
+                      If omitted, then defaults to "cr-namespace/cr-name".
                       This field cannot be changed after the resource creation.
                     pattern: ^[a-z0-9][.a-z0-9_-]*(/[a-z0-9][.a-z0-9_-]*)*$
                     type: string
@@ -311,10 +316,10 @@ rules:
   - ""
   resources:
   - configmaps
+  - namespaces
   verbs:
   - get
   - list
-  - update
   - watch
 - apiGroups:
   - ""
@@ -473,20 +478,20 @@ data:
     )
     LOGGER = logging.getLogger(__name__)
     QUAY_API_URL = "https://quay.io/api/v1"
-    RETRY_LIMIT = 5
 
     processed_repos_counter = itertools.count()
+    auth_errors_limit = 1000
 
 
     ImageRepo = Dict[str, Any]
 
 
-    def get_quay_tags(quay_token: str, namespace: str, name: str) -> List[ImageRepo]:
+    def get_quay_tags(quay_token: str, namespace: str, name: str) -> Dict[str, Any]:
         next_page = None
         resp: HTTPResponse
+        auth_errors_counter = 0
+        all_tags = {}
 
-        all_tags = []
-        retry_count = 0
         while True:
             query_args = {"limit": 100, "onlyActiveTags": True}
             if next_page is not None:
@@ -502,27 +507,39 @@ data:
                     if resp.status != 200:
                         raise RuntimeError(resp.reason)
                     json_data = json.loads(resp.read())
-                    retry_count = 0
+                auth_errors_counter = 0
             except HTTPError as ex:
+                if ex.status == 401:
+                    if auth_errors_counter > auth_errors_limit:
+                        raise(ex)
+
+                    auth_errors_counter += 1
+                    LOGGER.info("Auth error, will retry")
+                    time.sleep(1)
+                    continue
+
+                auth_errors_counter = 0
                 if ex.status == 404:
                     LOGGER.info("Repository doesn't exist anymore %s/%s", namespace, name)
-                    return []
+                    return {}
 
                 if ex.status == 502 or ex.status == 504:
-                    if retry_count > RETRY_LIMIT:
-                        LOGGER.info("Gateway error, retry reached retry limit %s", RETRY_LIMIT)
-                        raise
-
-                    retry_count += 1
                     LOGGER.info("Gateway error, will retry")
-                    time.sleep(2)
+                    time.sleep(1)
                     continue
-                raise
+
+                LOGGER.info("Http %s error, will retry", ex.status)
+                time.sleep(1)
+                continue
+
+            except json.JSONDecodeError:
+                auth_errors_counter = 0
+                LOGGER.info("Json decoder error, will retry")
+                continue
 
             tags = json_data.get("tags", [])
             # store only name & manifest_digest keys, as others aren't used and take memory
-            new_tags = [{"name": tag["name"], "manifest_digest": tag["manifest_digest"]} for tag in tags]
-            all_tags.extend(new_tags)
+            all_tags.update({tag["name"]: tag["manifest_digest"] for tag in tags})
 
             if not tags:
                 LOGGER.debug("No tags found.")
@@ -545,15 +562,35 @@ data:
             "Authorization": f"Bearer {quay_token}",
         })
         resp: HTTPResponse
-        try:
-            with urlopen(request) as resp:
-                if resp.status != 200 and resp.status != 204:
-                    raise RuntimeError(resp.reason)
+        auth_errors_counter = 0
 
-        except HTTPError as ex:
-            # ignore if not found
-            if ex.status != 404:
-                raise(ex)
+        while True:
+            try:
+                with urlopen(request) as resp:
+                    if resp.status != 200 and resp.status != 204:
+                        raise RuntimeError(resp.reason)
+            except HTTPError as ex:
+                if ex.status == 401:
+                    if auth_errors_counter > auth_errors_limit:
+                        raise(ex)
+
+                    auth_errors_counter += 1
+                    LOGGER.info("Auth error, will retry")
+                    time.sleep(1)
+                    continue
+
+                auth_errors_counter = 0
+                if ex.status == 502 or ex.status == 504:
+                    LOGGER.info("Gateway error, will retry")
+                    time.sleep(1)
+                    continue
+
+                # ignore if not found
+                if ex.status != 404:
+                    LOGGER.info("Http %s error, will retry", ex.status)
+                    time.sleep(1)
+                    continue
+            break
 
 
     def manifest_exists(quay_token: str, namespace: str, name: str, manifest: str) -> bool:
@@ -563,26 +600,43 @@ data:
         })
         resp: HTTPResponse
         manifest_exists = True
-        try:
-            with urlopen(request) as resp:
-                if resp.status != 200 and resp.status != 204:
-                    raise RuntimeError(resp.reason)
+        auth_errors_counter = 0
 
-        except HTTPError as ex:
-            if ex.status != 404:
-                raise(ex)
-            else:
-                manifest_exists = False
+        while True:
+            try:
+                with urlopen(request) as resp:
+                    if resp.status != 200 and resp.status != 204:
+                        raise RuntimeError(resp.reason)
+            except HTTPError as ex:
+                if ex.status == 401:
+                    if auth_errors_counter > auth_errors_limit:
+                        raise(ex)
 
+                    auth_errors_counter += 1
+                    LOGGER.info("Auth error, will retry")
+                    time.sleep(1)
+                    continue
+
+                auth_errors_counter = 0
+                if ex.status == 502 or ex.status == 504:
+                    LOGGER.info("Gateway error, will retry")
+                    time.sleep(1)
+                    continue
+
+                if ex.status == 404:
+                    manifest_exists = False
+                else:
+                    LOGGER.info("Http %s error, will retry", ex.status)
+                    time.sleep(1)
+                    continue
+            break
         return manifest_exists
 
 
-    def remove_tags(tags: List[Dict[str, Any]], quay_token: str, namespace: str, name: str, dry_run: bool = False) -> None:
-        tags_map = {tag_info["name"]: tag_info["manifest_digest"] for tag_info in tags}
-        # delete tags to save memory
-        del(tags)
-        image_digests = [digest for _, digest in tags_map.items()]
-        tag_regex = re.compile(r"^sha256-([0-9a-f]+)(\.sbom|\.att|\.src|\.sig|\.dockerfile)$")
+    def remove_tags(tags_map: Dict[str, Any], quay_token: str, namespace: str, name: str, dry_run: bool = False) -> None:
+        image_digests = set(tags_map.values())
+        # sha without any extension is clair report
+        tag_regex = re.compile(r"^sha256-([0-9a-f]+)(\.sbom|\.att|\.src|\.sig|\.dockerfile)?$")
         manifests_checked = {}
         for tag_name in tags_map:
             # attestation or sbom image
@@ -623,7 +677,11 @@ data:
         for repo in repos:
             namespace = repo["namespace"]
             name = repo["name"]
+            # skip huge repository for which we can't get all tags
+            if name == "ocp-art-tenant/art-images":
+                continue
             LOGGER.info("Processing repository %s: %s/%s", next(processed_repos_counter), namespace, name)
+
             all_tags = get_quay_tags(quay_token, namespace, name)
 
             if not all_tags:
@@ -635,6 +693,8 @@ data:
     def fetch_image_repos(access_token: str, namespace: str) -> Iterator[List[ImageRepo]]:
         next_page = None
         resp: HTTPResponse
+        auth_errors_counter = 0
+
         while True:
             query_args = {"namespace": namespace}
             if next_page is not None:
@@ -645,10 +705,37 @@ data:
                 "Authorization": f"Bearer {access_token}",
             })
 
-            with urlopen(request) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(resp.reason)
-                json_data = json.loads(resp.read())
+            try:
+                with urlopen(request) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(resp.reason)
+                    json_data = json.loads(resp.read())
+                auth_errors_counter = 0
+
+            except HTTPError as ex:
+                if ex.status == 401:
+                    if auth_errors_counter > auth_errors_limit:
+                        raise(ex)
+
+                    auth_errors_counter += 1
+                    LOGGER.info("Auth error, will retry")
+                    time.sleep(1)
+                    continue
+
+                auth_errors_counter = 0
+                if ex.status == 502 or ex.status == 504:
+                    LOGGER.info("Gateway error, will retry")
+                    time.sleep(1)
+                    continue
+
+                LOGGER.info("Http %s error, will retry", ex.status)
+                time.sleep(1)
+                continue
+
+            except json.JSONDecodeError:
+                auth_errors_counter = 0
+                LOGGER.info("Json decoder error, will retry")
+                continue
 
             repos = json_data.get("repositories", [])
             if not repos:
@@ -684,7 +771,7 @@ data:
         main()
 kind: ConfigMap
 metadata:
-  name: image-controller-image-pruner-configmap-tc4f9c8t66
+  name: image-controller-image-pruner-configmap-hgm7kmgb6k
   namespace: image-controller
 ---
 apiVersion: v1
@@ -743,14 +830,18 @@ data:
             },
         )
 
-        with urlopen(request) as resp:
-            if resp.status != 200:
-                # do not fail the job if we can't fetch notifications
-                # for single repository
-                LOGGER.warning("Failed to fetch notifications for %s/%s", namespace, name)
-                json_data = {}
-            else:
-                json_data = json.loads(resp.read())
+        try:
+            with urlopen(request) as resp:
+                if resp.status != 200:
+                    # do not fail the job if we can't fetch notifications
+                    # for single repository
+                    LOGGER.warning("Failed to fetch notifications for %s/%s", namespace, name)
+                    json_data = {}
+                else:
+                    json_data = json.loads(resp.read())
+        except HTTPError:
+            LOGGER.warning("Failed to fetch notifications for %s/%s", namespace, name)
+            json_data = {}
 
         return json_data.get("notifications", [])
 
@@ -918,7 +1009,7 @@ data:
         main()
 kind: ConfigMap
 metadata:
-  name: image-controller-notification-resetter-configmap-b2kb8hg596
+  name: image-controller-notification-resetter-configmap-tfm9h79698
   namespace: image-controller
 ---
 apiVersion: v1
@@ -968,7 +1059,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: quay.io/konflux-ci/image-controller:2c2a5c5369084cc0f06c90996ce961a2a791bfb3
+        image: quay.io/konflux-ci/image-controller:b31f86d8dce91a4b449c93874edc293eff79be03
         livenessProbe:
           httpGet:
             path: /healthz
@@ -1035,12 +1126,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   key: quaytoken
-                  name: quaytoken
+                  name: image-pruner-token
             - name: NAMESPACE
               valueFrom:
                 secretKeyRef:
                   key: organization
-                  name: quaytoken
+                  name: image-pruner-token
             image: registry.access.redhat.com/ubi8/python-39:1-201.1729679484
             imagePullPolicy: IfNotPresent
             name: image-pruner
@@ -1061,11 +1152,11 @@ spec:
             runAsNonRoot: true
           volumes:
           - configMap:
-              name: image-controller-image-pruner-configmap-tc4f9c8t66
+              name: image-controller-image-pruner-configmap-hgm7kmgb6k
             name: image-pruner-volume
-          - name: quaytoken
+          - name: image-pruner-token
             secret:
-              secretName: quaytoken
+              secretName: image-pruner-token
   schedule: 0 0 * * *
 ---
 apiVersion: batch/v1
@@ -1115,7 +1206,7 @@ spec:
             runAsNonRoot: true
           volumes:
           - configMap:
-              name: image-controller-notification-resetter-configmap-b2kb8hg596
+              name: image-controller-notification-resetter-configmap-tfm9h79698
             name: notification-resetter-volume
           - name: quaytoken
             secret:
